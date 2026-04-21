@@ -20,9 +20,12 @@ class Config:
     agc_enabled: bool = os.getenv("AGC_ENABLED", "true").lower() == "true"
     agc_target_dbfs: float = float(os.getenv("AGC_TARGET_DBFS", "-18.0"))
 
-    # ZeroMQ publisher
-    zmq_bind: str = os.getenv("ZMQ_BIND", "tcp://*:5555")
-    zmq_topic: str = os.getenv("ZMQ_TOPIC", "audio.raw")
+    # ZeroMQ publisher (used by downstream: wake-word, whisper)
+    zmq_bind: str  = os.getenv("ZMQ_BIND",      "tcp://*:5555")
+    zmq_topic: str = os.getenv("ZMQ_TOPIC",     "audio.raw")
+
+    # ZeroMQ PULL — receives virtual frames from debug_neural.py (mordomo-people)
+    zmq_pull_bind: str = os.getenv("ZMQ_PULL_BIND", "tcp://*:5556")
 
     # NATS (health + status publishing)
     nats_url: str = os.getenv("NATS_URL", "nats://nats:4222")
