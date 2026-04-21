@@ -45,9 +45,10 @@ async def _nats_heartbeat(nc):
         await nc.publish("audio.capture.status", json.dumps(payload).encode())
 
 
-def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None):
+def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc=None):
     """Blocking audio capture loop — runs in a thread."""
     frame_size = config.frame_size
+    last_telemetry = 0
 
     logger.info(
         f"Starting capture: device={config.device_index}, "
@@ -69,17 +70,33 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None):
                 logger.debug("Audio buffer overflow")
 
             samples = frame[:, 0]  # mono
-
+            
+            # Simple energy calculation (RMS)
+            rms = float(np.sqrt(np.mean(samples.astype(np.float32)**2)))
+            
             if agc:
                 samples = agc.process(samples)
 
             pcm = samples.tobytes()
-
             _stats["frames_total"] += 1
 
-            if vad.is_speech(pcm):
+            is_speech = vad.is_speech(pcm)
+            if is_speech:
                 _stats["frames_speech"] += 1
                 publisher.publish(pcm)
+
+            # Publish energy telemetry to NATS every 100ms for debug monitor
+            if nc and (time.time() - last_telemetry > 0.1):
+                last_telemetry = time.time()
+                import json
+                asyncio.run_coroutine_threadsafe(
+                    nc.publish("mordomo.audio.vad.energy", json.dumps({
+                        "energy": round(rms, 2),
+                        "is_speech": is_speech,
+                        "device": config.device_index
+                    }).encode()),
+                    asyncio.get_event_loop()
+                )
 
 
 async def main():
@@ -124,7 +141,7 @@ async def main():
     # ── Capture loop in thread (blocking) ─────────────────────────────
     loop = asyncio.get_event_loop()
     try:
-        await loop.run_in_executor(None, _audio_loop, publisher, vad, agc)
+        await loop.run_in_executor(None, _audio_loop, publisher, vad, agc, nc)
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
