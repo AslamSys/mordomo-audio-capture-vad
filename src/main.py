@@ -5,6 +5,7 @@ Also publishes health status to NATS every 30 s.
 import asyncio
 import logging
 import time
+import json
 
 import numpy as np
 import sounddevice as sd
@@ -90,7 +91,6 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc
             # Telemetry for monitor
             if nc and loop and (time.time() - last_telemetry > 0.1):
                 last_telemetry = time.time()
-                import json
                 asyncio.run_coroutine_threadsafe(
                     nc.publish("mordomo.audio.vad.energy", json.dumps({
                         "energy": round(rms, 2),
