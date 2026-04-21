@@ -136,8 +136,28 @@ async def main():
                 "timestamp": time.time()
             }).encode())
 
+        async def _nats_audio_stream(msg):
+            """Handler for virtual audio stream coming from NATS (Browser)."""
+            if not _mic_enabled and vad:
+                try:
+                    data = msg.data
+                    # Process virtual audio just like hardware
+                    chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    # RMS for telemetry
+                    rms = np.sqrt(np.mean(chunk**2))
+                    await nc.publish("mordomo.audio.vad.energy", json.dumps({"rms": float(rms)}).encode())
+                    
+                    # VAD Detection
+                    if vad.process(chunk):
+                        logger.info("🎙️  VIRTUAL SPEECH DETECTED")
+                        await nc.publish("mordomo.audio.vad.speech", data)
+                except Exception as e:
+                    logger.error(f"Virtual VAD Error: {e}")
+
         await nc.subscribe("mordomo.audio.capture.open", cb=_toggle_mic)
         await nc.subscribe("mordomo.audio.capture.close", cb=_toggle_mic)
+        await nc.subscribe("mordomo.audio.stream", cb=_nats_audio_stream)
         asyncio.create_task(_nats_heartbeat(nc))
     except Exception as e:
         logger.warning(f"Control channel failed: {e}")
