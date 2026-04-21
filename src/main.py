@@ -86,11 +86,10 @@ def _virtual_pull_loop(publisher: AudioPublisher, vad: VADPipeline, nc=None, loo
         _stats["frames_virtual"] += 1
         _stats["frames_total"] += 1
 
-        # Apply VAD — only publish if speech detected
-        is_speech = vad.is_speech(pcm_bytes)
-        if is_speech:
-            _stats["frames_speech"] += 1
-            publisher.publish(pcm_bytes)
+        # Virtual frames bypass VAD — publish ALL frames directly.
+        # The Wake Word detector has its own decision logic.
+        # (VAD filtering is only needed to save bandwidth from the hardware mic.)
+        publisher.publish(pcm_bytes)
 
         # Telemetry for dashboard
         if nc and loop and (time.time() - last_telemetry > 0.1):
@@ -101,14 +100,15 @@ def _virtual_pull_loop(publisher: AudioPublisher, vad: VADPipeline, nc=None, loo
                 nc.publish(
                     "mordomo.audio.vad.energy",
                     json.dumps({
-                        "energy": round(rms, 2),
-                        "is_speech": is_speech,
+                        "energy": round(rms, 6),
+                        "is_speech": rms > 100,   # rough threshold for display only
                         "enabled": True,
                         "source": "virtual",
                     }).encode(),
                 ),
                 loop,
             )
+
 
     sock.close()
 
