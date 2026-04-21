@@ -29,32 +29,32 @@ _stats = {
 }
 
 
+# ── Globals ──────────────────────────────────────────────────────────────────
+_mic_enabled = False
+
 async def _nats_heartbeat(nc):
     import json
     while True:
         await asyncio.sleep(30)
         payload = {
             "service": "audio-capture-vad",
+            "enabled": _mic_enabled,
             "uptime_seconds": int(time.time() - _stats["started_at"]),
             "frames_total": _stats["frames_total"],
             "frames_speech": _stats["frames_speech"],
             "sample_rate": config.sample_rate,
-            "frame_duration_ms": config.frame_duration_ms,
-            "vad_mode": config.vad_mode,
+            "device": config.device_index
         }
         await nc.publish("audio.capture.status", json.dumps(payload).encode())
 
 
 def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc=None):
     """Blocking audio capture loop — runs in a thread."""
+    global _mic_enabled
     frame_size = config.frame_size
     last_telemetry = 0
 
-    logger.info(
-        f"Starting capture: device={config.device_index}, "
-        f"rate={config.sample_rate}, frame={frame_size} samples "
-        f"({config.frame_duration_ms}ms)"
-    )
+    logger.info(f"Capture service ready. (Device={config.device_index})")
 
     with sd.InputStream(
         device=config.device_index,
@@ -63,15 +63,17 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc
         dtype="int16",
         blocksize=frame_size,
     ) as stream:
-        logger.info("Microphone open — streaming started")
         while True:
+            # Check mic state before processing logic
+            if not _mic_enabled:
+                time.sleep(0.1)
+                continue
+
             frame, overflowed = stream.read(frame_size)
             if overflowed:
                 logger.debug("Audio buffer overflow")
 
             samples = frame[:, 0]  # mono
-            
-            # Simple energy calculation (RMS)
             rms = float(np.sqrt(np.mean(samples.astype(np.float32)**2)))
             
             if agc:
@@ -85,7 +87,7 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc
                 _stats["frames_speech"] += 1
                 publisher.publish(pcm)
 
-            # Publish energy telemetry to NATS every 100ms for debug monitor
+            # Telemetry for monitor
             if nc and (time.time() - last_telemetry > 0.1):
                 last_telemetry = time.time()
                 import json
@@ -93,52 +95,51 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc
                     nc.publish("mordomo.audio.vad.energy", json.dumps({
                         "energy": round(rms, 2),
                         "is_speech": is_speech,
-                        "device": config.device_index
+                        "enabled": _mic_enabled
                     }).encode()),
                     asyncio.get_event_loop()
                 )
 
 
 async def main():
+    global _mic_enabled
     # ── ZeroMQ publisher ───────────────────────────────────────────────
     publisher = AudioPublisher(config.zmq_bind, config.zmq_topic)
     publisher.start()
 
-    # ── VAD ────────────────────────────────────────────────────────────
-    vad = VADPipeline(
-        mode=config.vad_mode,
-        sample_rate=config.sample_rate,
-        frame_duration_ms=config.frame_duration_ms,
-        hangover_frames=config.hangover_frames,
-    )
-
-    # ── AGC ────────────────────────────────────────────────────────────
+    # ── VAD & AGC ──────────────────────────────────────────────────────
+    vad = VADPipeline(mode=config.vad_mode, sample_rate=config.sample_rate)
     agc = AGC(target_dbfs=config.agc_target_dbfs) if config.agc_enabled else None
 
     # ── NATS ───────────────────────────────────────────────────────────
     try:
-        async def error_cb(e):
-            logger.error(f"NATS error: {e}")
+        nc = await nats.connect(config.nats_url)
+        logger.info("Control channel connected to NATS")
+        
+        async def _toggle_mic(msg):
+            global _mic_enabled
+            cmd = msg.data.decode().lower()
+            if "open" in cmd:
+                _mic_enabled = True
+                logger.warning("🎙️  MICROPHONE OPENED VIA REMOTE COMMAND")
+            else:
+                _mic_enabled = False
+                logger.info("💤  MICROPHONE CLOSED VIA REMOTE COMMAND")
+            
+            # Broadcast state
+            await nc.publish("mordomo.audio.capture.state", json.dumps({
+                "enabled": _mic_enabled,
+                "timestamp": time.time()
+            }).encode())
 
-        async def reconnected_cb():
-            logger.warning("NATS reconnected")
-
-        async def disconnected_cb():
-            logger.warning("NATS disconnected")
-
-        nc = await nats.connect(
-            config.nats_url,
-            error_cb=error_cb,
-            reconnected_cb=reconnected_cb,
-            disconnected_cb=disconnected_cb,
-        )
-        logger.info(f"Connected to NATS: {config.nats_url}")
+        await nc.subscribe("mordomo.audio.capture.open", cb=_toggle_mic)
+        await nc.subscribe("mordomo.audio.capture.close", cb=_toggle_mic)
         asyncio.create_task(_nats_heartbeat(nc))
     except Exception as e:
-        logger.warning(f"NATS unavailable — continuing without heartbeat: {e}")
+        logger.warning(f"Control channel failed: {e}")
         nc = None
 
-    # ── Capture loop in thread (blocking) ─────────────────────────────
+    # ── Capture loop (blocking) ───────────────────────────────────────
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(None, _audio_loop, publisher, vad, agc, nc)
