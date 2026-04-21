@@ -117,38 +117,44 @@ async def main():
     agc = AGC(target_dbfs=config.agc_target_dbfs) if config.agc_enabled else None
 
     # ── NATS ───────────────────────────────────────────────────────────
+    _virtual_active = False 
     try:
         nc = await nats.connect(config.nats_url)
         logger.info("Control channel connected to NATS")
         
         async def _toggle_mic(msg):
             global _mic_enabled
-            cmd = msg.data.decode().lower()
-            if "open" in cmd:
-                _mic_enabled = True
-                logger.warning("🎙️  MICROPHONE OPENED")
+            nonlocal _virtual_active
+            try:
+                payload = json.loads(msg.data.decode())
+            except:
+                payload = {"source": "hardware"}
+            
+            source = payload.get("source", "hardware")
+            is_open = "open" in msg.subject
+            
+            if source == "browser-pc":
+                _virtual_active = is_open
+                logger.warning(f"🌐 VIRTUAL SESSION {'STARTED' if is_open else 'ENDED'}")
             else:
-                _mic_enabled = False
-                logger.info("💤  MICROPHONE CLOSED")
+                _mic_enabled = is_open
+                logger.warning(f"🎙️ HARDWARE MIC {'OPENED' if is_open else 'CLOSED'}")
             
             await nc.publish("mordomo.audio.capture.state", json.dumps({
-                "enabled": _mic_enabled,
+                "enabled": _mic_enabled or _virtual_active,
+                "source": source,
                 "timestamp": time.time()
             }).encode())
 
         async def _nats_audio_stream(msg):
             """Handler for virtual audio stream coming from NATS (Browser)."""
-            if not _mic_enabled and vad:
+            if _virtual_active and vad:
                 try:
                     data = msg.data
-                    # Process virtual audio just like hardware
                     chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                    
-                    # RMS for telemetry
                     rms = np.sqrt(np.mean(chunk**2))
                     await nc.publish("mordomo.audio.vad.energy", json.dumps({"rms": float(rms)}).encode())
                     
-                    # VAD Detection
                     if vad.is_speech(data):
                         logger.info("🎙️  VIRTUAL SPEECH DETECTED")
                         await nc.publish("mordomo.audio.vad.speech", data)
