@@ -149,7 +149,7 @@ async def main():
                     await nc.publish("mordomo.audio.vad.energy", json.dumps({"rms": float(rms)}).encode())
                     
                     # VAD Detection
-                    if vad.process(chunk):
+                    if vad.is_speech(data):
                         logger.info("🎙️  VIRTUAL SPEECH DETECTED")
                         await nc.publish("mordomo.audio.vad.speech", data)
                 except Exception as e:
