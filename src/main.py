@@ -48,7 +48,7 @@ async def _nats_heartbeat(nc):
         await nc.publish("audio.capture.status", json.dumps(payload).encode())
 
 
-def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc=None):
+def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc=None, loop=None):
     """Blocking audio capture loop — runs in a thread."""
     global _mic_enabled
     frame_size = config.frame_size
@@ -88,7 +88,7 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc
                 publisher.publish(pcm)
 
             # Telemetry for monitor
-            if nc and (time.time() - last_telemetry > 0.1):
+            if nc and loop and (time.time() - last_telemetry > 0.1):
                 last_telemetry = time.time()
                 import json
                 asyncio.run_coroutine_threadsafe(
@@ -97,7 +97,7 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc
                         "is_speech": is_speech,
                         "enabled": _mic_enabled
                     }).encode()),
-                    asyncio.get_event_loop()
+                    loop
                 )
 
 
@@ -108,7 +108,12 @@ async def main():
     publisher.start()
 
     # ── VAD & AGC ──────────────────────────────────────────────────────
-    vad = VADPipeline(mode=config.vad_mode, sample_rate=config.sample_rate)
+    vad = VADPipeline(
+        mode=config.vad_mode, 
+        sample_rate=config.sample_rate,
+        frame_duration_ms=config.frame_duration_ms,
+        hangover_frames=config.hangover_frames
+    )
     agc = AGC(target_dbfs=config.agc_target_dbfs) if config.agc_enabled else None
 
     # ── NATS ───────────────────────────────────────────────────────────
@@ -121,12 +126,11 @@ async def main():
             cmd = msg.data.decode().lower()
             if "open" in cmd:
                 _mic_enabled = True
-                logger.warning("🎙️  MICROPHONE OPENED VIA REMOTE COMMAND")
+                logger.warning("🎙️  MICROPHONE OPENED")
             else:
                 _mic_enabled = False
-                logger.info("💤  MICROPHONE CLOSED VIA REMOTE COMMAND")
+                logger.info("💤  MICROPHONE CLOSED")
             
-            # Broadcast state
             await nc.publish("mordomo.audio.capture.state", json.dumps({
                 "enabled": _mic_enabled,
                 "timestamp": time.time()
@@ -142,7 +146,7 @@ async def main():
     # ── Capture loop (blocking) ───────────────────────────────────────
     loop = asyncio.get_event_loop()
     try:
-        await loop.run_in_executor(None, _audio_loop, publisher, vad, agc, nc)
+        await loop.run_in_executor(None, _audio_loop, publisher, vad, agc, nc, loop)
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
