@@ -146,18 +146,27 @@ async def main():
                 "timestamp": time.time()
             }).encode())
 
+        _virtual_audio_buffer = bytearray()
+
         async def _nats_audio_stream(msg):
             """Handler for virtual audio stream coming from NATS (Browser)."""
+            nonlocal _virtual_audio_buffer
             if _virtual_active and vad:
                 try:
                     data = msg.data
-                    chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                    rms = np.sqrt(np.mean(chunk**2))
-                    await nc.publish("mordomo.audio.vad.energy", json.dumps({"rms": float(rms)}).encode())
-                    
-                    if vad.is_speech(data):
-                        logger.info("🎙️  VIRTUAL SPEECH DETECTED")
-                        await nc.publish("mordomo.audio.vad.speech", data)
+                    _virtual_audio_buffer.extend(data)
+                    frame_size = vad._frame_bytes
+                    while len(_virtual_audio_buffer) >= frame_size:
+                        chunk_bytes = bytes(_virtual_audio_buffer[:frame_size])
+                        _virtual_audio_buffer = _virtual_audio_buffer[frame_size:]
+                        
+                        chunk_np = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                        rms = np.sqrt(np.mean(chunk_np**2))
+                        await nc.publish("mordomo.audio.vad.energy", json.dumps({"rms": float(rms)}).encode())
+                        
+                        if vad.is_speech(chunk_bytes):
+                            logger.info("🎙️  VIRTUAL SPEECH DETECTED")
+                            await nc.publish("mordomo.audio.vad.speech", chunk_bytes)
                 except Exception as e:
                     logger.error(f"Virtual VAD Error: {e}")
 
