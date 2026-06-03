@@ -23,6 +23,8 @@ from src.config import config
 from src.vad import VADPipeline
 from src.agc import AGC
 from src.publisher import AudioPublisher
+from src.resample import resample_int16
+from src.device_probe import resolve_capture_sample_rate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,9 +55,30 @@ async def _nats_heartbeat(nc):
             "frames_speech": _stats["frames_speech"],
             "frames_virtual": _stats["frames_virtual"],
             "sample_rate": config.sample_rate,
+            "capture_sample_rate": getattr(config, "_active_capture_rate", config.sample_rate),
             "device": config.device_index,
         }
         await nc.publish("audio.capture.status", json.dumps(payload).encode())
+
+
+async def _set_mic_enabled(nc, enabled: bool, reason: str):
+    global _mic_enabled
+    _mic_enabled = enabled
+    logger.warning(
+        "🎙️  HARDWARE MIC %s (%s)",
+        "OPENED" if enabled else "CLOSED",
+        reason,
+    )
+    if nc:
+        await nc.publish(
+            "mordomo.audio.capture.state",
+            json.dumps({
+                "enabled": _mic_enabled,
+                "source": "hardware",
+                "timestamp": time.time(),
+                "reason": reason,
+            }).encode(),
+        )
 
 
 def _virtual_pull_loop(publisher: AudioPublisher, vad: VADPipeline, nc=None, loop=None):
@@ -113,31 +136,46 @@ def _virtual_pull_loop(publisher: AudioPublisher, vad: VADPipeline, nc=None, loo
     sock.close()
 
 
-def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc=None, loop=None):
+def _audio_loop(
+    publisher: AudioPublisher,
+    vad: VADPipeline,
+    agc: AGC | None,
+    capture_sample_rate: int,
+    nc=None,
+    loop=None,
+):
     """Blocking hardware capture loop — runs in thread executor."""
     global _mic_enabled
-    frame_size   = config.frame_size
+    capture_frame_size = config.capture_frame_size(capture_sample_rate)
     last_telemetry = 0
 
-    logger.info(f"Capture service ready. (Device={config.device_index})")
+    logger.info(
+        "Capture service ready. (Device=%s, capture=%s Hz, output=%s Hz)",
+        config.device_index,
+        capture_sample_rate,
+        config.sample_rate,
+    )
 
     with sd.InputStream(
         device=config.device_index,
-        samplerate=config.sample_rate,
+        samplerate=capture_sample_rate,
         channels=config.channels,
         dtype="int16",
-        blocksize=frame_size,
+        blocksize=capture_frame_size,
     ) as stream:
         while True:
             if not _mic_enabled:
                 time.sleep(0.1)
                 continue
 
-            frame, overflowed = stream.read(frame_size)
+            frame, overflowed = stream.read(capture_frame_size)
             if overflowed:
                 logger.debug("Audio buffer overflow")
 
             samples = frame[:, 0]  # mono
+            if capture_sample_rate != config.sample_rate:
+                samples = resample_int16(samples, capture_sample_rate, config.sample_rate)
+
             rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
             if agc:
@@ -149,7 +187,9 @@ def _audio_loop(publisher: AudioPublisher, vad: VADPipeline, agc: AGC | None, nc
             is_speech = vad.is_speech(pcm)
             if is_speech:
                 _stats["frames_speech"] += 1
-                publisher.publish(pcm)
+
+            # Wake-word needs a continuous stream, not only VAD-positive frames.
+            publisher.publish(pcm)
 
             if nc and loop and (time.time() - last_telemetry > 0.1):
                 last_telemetry = time.time()
@@ -190,25 +230,28 @@ async def main():
         logger.info("Control channel connected to NATS")
 
         async def _toggle_mic(msg):
-            global _mic_enabled
             is_open = "open" in msg.subject
-            _mic_enabled = is_open
-            logger.warning(f"🎙️  HARDWARE MIC {'OPENED' if is_open else 'CLOSED'}")
-            await nc.publish(
-                "mordomo.audio.capture.state",
-                json.dumps({
-                    "enabled": _mic_enabled,
-                    "source": "hardware",
-                    "timestamp": time.time(),
-                }).encode(),
-            )
+            await _set_mic_enabled(nc, is_open, reason="nats")
 
         await nc.subscribe("mordomo.audio.capture.open",  cb=_toggle_mic)
         await nc.subscribe("mordomo.audio.capture.close", cb=_toggle_mic)
         asyncio.create_task(_nats_heartbeat(nc))
 
+        if config.mic_open_on_start:
+            await _set_mic_enabled(nc, True, reason="boot")
+
     except Exception as e:
         logger.warning(f"Control channel failed: {e} — running without NATS")
+        if config.mic_open_on_start:
+            _mic_enabled = True
+            logger.warning("🎙️  HARDWARE MIC OPENED (boot, NATS unavailable)")
+
+    capture_sample_rate = resolve_capture_sample_rate(
+        config.device_index,
+        config.sample_rate,
+        config.capture_sample_rate,
+    )
+    config._active_capture_rate = capture_sample_rate  # type: ignore[attr-defined]
 
     loop = asyncio.get_event_loop()
 
@@ -224,7 +267,9 @@ async def main():
 
     # ── Hardware capture loop (blocking executor) ──────────────────────────
     try:
-        await loop.run_in_executor(None, _audio_loop, publisher, vad, agc, nc, loop)
+        await loop.run_in_executor(
+            None, _audio_loop, publisher, vad, agc, capture_sample_rate, nc, loop
+        )
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:

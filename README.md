@@ -26,6 +26,31 @@
 
 ---
 
+## 🍊 Produção — Orange Pi + microfone USB (AB13X)
+
+| Variável | Valor recomendado | Notas |
+|----------|-------------------|--------|
+| `AUDIO_DEVICE_INDEX` | `1` | Índice `0` = ES8388 onboard (sem entrada USB no PortAudio) |
+| `SAMPLE_RATE` | `16000` | Taxa no **ZMQ** e downstream (wake-word, whisper) |
+| `CAPTURE_SAMPLE_RATE` | *(vazio)* | Auto: abre hardware em 48 kHz se preciso e faz **resample → 16 kHz** |
+| `MIC_OPEN_ON_START` | `true` | Abre o mic no boot (NATS `mordomo.audio.capture.open` interno) |
+
+**Bootstrap:** `mordomo-deploy` executa `scripts/release-alsa-capture.sh` antes do grupo `audio-pipeline` para matar `arecord` preso no host (bloqueia o USB).
+
+**ZMQ:** publica `audio.raw` em **16 kHz mono** continuamente (com mic aberto), não só em frames VAD — necessário para o wake-word.
+
+**Teste rápido:**
+
+```bash
+docker logs -f mordomo-audio-capture-vad   # esperar: MIC OPENED (boot), capture=48000, output=16000
+docker run --rm --network mordomo-net natsio/nats-box \
+  nats sub -s nats://nats:4222 "mordomo.audio.vad.energy" --count=5
+```
+
+**Próximo na pipeline:** [mordomo-wake-word-detector](https://github.com/AslamSys/mordomo-wake-word-detector) — consome `tcp://mordomo-audio-capture-vad:5555` tópico `audio.raw`.
+
+---
+
 ## 📋 Propósito
 
 **Produtor contínuo de áudio filtrado** - Captura áudio do microfone 24/7, aplica filtros (VAD, eco, ruído) e distribui via ZeroMQ para todos os consumidores (Wake Word Detector e futuros componentes). Este container é a **única fonte de áudio** do sistema.

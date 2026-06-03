@@ -2,13 +2,21 @@ import os
 
 
 class Config:
-    # Audio device
+    # Audio device (PortAudio index; 1 = AB13X USB on Orange Pi)
     device_index: int | None = (
         int(os.getenv("AUDIO_DEVICE_INDEX"))
         if os.getenv("AUDIO_DEVICE_INDEX") is not None
         else None
     )
+    # Output rate: ZMQ, WebRTC VAD, downstream (wake-word, whisper)
     sample_rate: int = int(os.getenv("SAMPLE_RATE", "16000"))
+    # Hardware rate; empty = auto (tries SAMPLE_RATE then 48000, …)
+    capture_sample_rate: int | None = (
+        int(os.getenv("CAPTURE_SAMPLE_RATE"))
+        if os.getenv("CAPTURE_SAMPLE_RATE", "").strip()
+        else None
+    )
+    mic_open_on_start: bool = os.getenv("MIC_OPEN_ON_START", "true").lower() == "true"
     channels: int = 1
     frame_duration_ms: int = int(os.getenv("FRAME_DURATION_MS", "30"))   # 10 | 20 | 30
     hangover_ms: int = int(os.getenv("VAD_HANGOVER_MS", "300"))           # silence tail
@@ -32,8 +40,12 @@ class Config:
 
     @property
     def frame_size(self) -> int:
-        """Samples per VAD frame."""
+        """Samples per VAD frame at output sample_rate."""
         return int(self.sample_rate * self.frame_duration_ms / 1000)
+
+    def capture_frame_size(self, capture_sample_rate: int) -> int:
+        """Samples per read at hardware capture rate."""
+        return int(capture_sample_rate * self.frame_duration_ms / 1000)
 
     @property
     def hangover_frames(self) -> int:
